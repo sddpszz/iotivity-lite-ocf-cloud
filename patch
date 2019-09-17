@@ -1,0 +1,889 @@
+diff --git a/apps/simpleclient.c b/apps/simpleclient.c
+old mode 100644
+new mode 100755
+index 07e1a7d..db609ed
+--- a/apps/simpleclient.c
++++ b/apps/simpleclient.c
+@@ -15,13 +15,50 @@
+ */
+ 
+ #include "oc_api.h"
++#include "oc_uuid.h"
++#include "oc_core_res.h"
+ #include "port/oc_clock.h"
++#include "oc_collection.h"
++
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ pthread_mutex_t mutex;
+ pthread_cond_t cv;
++
++pthread_mutex_t user_mutex;
++pthread_cond_t user_cv;
++
++pthread_mutex_t lock_mutex;
++
++
++void down()
++{
++	pthread_mutex_lock(&user_mutex);
++	pthread_cond_wait(&user_cv,&user_mutex);
++	pthread_mutex_unlock(&user_mutex);
++}
++
++void up()
++{
++	pthread_mutex_lock(&user_mutex);
++	pthread_cond_signal(&user_cv);
++	pthread_mutex_unlock(&user_mutex);
++}
++
++void lock()
++{
++	pthread_mutex_lock(&lock_mutex);
++}
++
++void unlock()
++{
++	pthread_mutex_unlock(&lock_mutex);
++}
++
++
+ struct timespec ts;
+ 
+ int quit = 0;
+@@ -35,220 +72,490 @@ app_init(void)
+   return ret;
+ }
+ 
+-#define MAX_URI_LENGTH (30)
+-static char a_light[MAX_URI_LENGTH];
+-static oc_endpoint_t *light_server;
+-
+-static bool state;
+-static int power;
+-static oc_string_t name;
++static void
++signal_event_loop(void)
++{
++  pthread_mutex_lock(&mutex);
++  pthread_cond_signal(&cv);
++  pthread_mutex_unlock(&mutex);
++}
+ 
+-static oc_event_callback_retval_t
+-stop_observe(void *data)
++void
++handle_signal(int signal)
+ {
+-  (void)data;
+-  PRINT("Stopping OBSERVE\n");
+-  oc_stop_observe(a_light, light_server);
+-  return OC_EVENT_DONE;
++  (void)signal;
++  signal_event_loop();
++  quit = 1;
+ }
+ 
+-static void
+-observe_light(oc_client_response_t *data)
++oc_endpoint_t s_cloudEndpoint;
++
++/** Account URI.*/
++#define ACCOUNT_URI "/oic/account"
++
++/** Account session URI.*/
++#define ACCOUNT_SESSION_URI "/oic/account/session"
++
++/** RD.*/
++#define RD_URI "/oic/rd"
++
++
++#define MAX_UUID_LENGTH 37
++char *s_authcode = NULL;
++
++oc_string_t uid;
++oc_string_t access_token;
++
++oc_resource_t *s_pResource1 = NULL;
++oc_resource_t *s_pResource2 = NULL;
++
++
++
++bool s_lightState = false;
++
++bool ocSignInWithAuth();
++bool rd_publish(oc_endpoint_t *endpoint, oc_link_t *links, int device_index,oc_response_handler_t handler, oc_qos_t qos, void *user_data);
++bool rd_publish_all(oc_endpoint_t *endpoint, int device_index,oc_response_handler_t handler, oc_qos_t qos, void *user_data);
++
++static bool
++_oc_sign_up(oc_endpoint_t *endpoint, const char *auth_provider,
++            const char *auth_code, const char *uid, const char *access_token, 
++            int device_index, oc_response_handler_t handler, void *user_data)
+ {
+-  PRINT("OBSERVE_light:\n");
+-  oc_rep_t *rep = data->payload;
+-  while (rep != NULL) {
+-    PRINT("key %s, value ", oc_string(rep->name));
+-    switch (rep->type) {
+-    case OC_REP_BOOL:
+-      PRINT("%d\n", rep->value.boolean);
+-      state = rep->value.boolean;
+-      break;
+-    case OC_REP_INT:
+-      PRINT("%d\n", rep->value.integer);
+-      power = (int)rep->value.integer;
+-      break;
+-    case OC_REP_STRING:
+-      PRINT("%s\n", oc_string(rep->value.string));
+-      if (oc_string_len(name))
+-        oc_free_string(&name);
+-      oc_new_string(&name, oc_string(rep->value.string),
+-                    oc_string_len(rep->value.string));
+-      break;
+-    default:
+-      break;
++  if (!endpoint || ((!auth_provider || !auth_code) && !access_token) ||
++      !handler) {
++    OC_ERR("Error of input parameters");
++    return false;
++  }
++
++  if (oc_init_post(ACCOUNT_URI, endpoint, NULL, handler, LOW_QOS,
++                   user_data)) {
++    char uuid[MAX_UUID_LENGTH] = { 0 };
++    oc_uuid_to_str(oc_core_get_device_id(device_index), uuid, MAX_UUID_LENGTH);
++    
++    oc_rep_start_root_object();
++
++	OC_DBG("di =%s ,uuid = %s \n",oc_core_get_device_id(device_index),uuid);
++    oc_rep_set_text_string(root, di, uuid);
++    if (auth_provider)
++      oc_rep_set_text_string(root, authprovider, auth_provider);
++    if (auth_code) {
++      oc_rep_set_text_string(root, authcode, auth_code);
++    } else {
++      if (uid)
++        oc_rep_set_text_string(root, uid, uid);
++      oc_rep_set_text_string(root, accesstoken, access_token);
+     }
+-    rep = rep->next;
++    
++    oc_rep_set_text_string(root, devicetype, "device");
++    oc_rep_end_root_object();
++  } else {
++    OC_ERR("Could not init POST request for sign up");
++    return false;
+   }
++
++  return oc_do_post();
+ }
+ 
+-static void
+-post2_light(oc_client_response_t *data)
++
++
++bool
++oc_sign_up_with_auth(oc_endpoint_t *endpoint, const char *auth_provider,
++                     const char *auth_code, int device_index,
++                     oc_response_handler_t handler, void *user_data)
+ {
+-  PRINT("POST2_light:\n");
+-  if (data->code == OC_STATUS_CHANGED)
+-    PRINT("POST response: CHANGED\n");
+-  else if (data->code == OC_STATUS_CREATED)
+-    PRINT("POST response: CREATED\n");
+-  else
+-    PRINT("POST response code %d\n", data->code);
+-
+-  oc_do_observe(a_light, light_server, NULL, &observe_light, LOW_QOS, NULL);
+-  oc_set_delayed_callback(NULL, &stop_observe, 30);
+-  PRINT("Sent OBSERVE request\n");
++  return _oc_sign_up(endpoint, auth_provider, auth_code, NULL, NULL,
++                     device_index, handler, user_data);
+ }
+ 
+-static void
+-post_light(oc_client_response_t *data)
++static void parsePayload(oc_client_response_t *data) {
++	oc_rep_t *rep = data->payload;
++	while (rep != NULL) {
++		printf("key %s, value ", oc_string(rep->name));
++		switch (rep->type) {
++		case OC_REP_BOOL:
++			printf("%d\n", rep->value.boolean);
++			break;
++		case OC_REP_INT:
++			printf("%d\n", rep->value.integer);
++			break;
++		case OC_REP_STRING:
++			printf("%s\n", oc_string(rep->value.string));
++			if (strncmp("uid", oc_string(rep->name), oc_string_len(rep->name))
++					== 0) {
++				if (oc_string_len(uid))
++					oc_free_string(&uid);
++				oc_new_string(&uid, oc_string(rep->value.string),
++						oc_string_len(rep->value.string));
++			} else if (strncmp("accesstoken", oc_string(rep->name),
++					oc_string_len(rep->name)) == 0) {
++				if (oc_string_len(access_token))
++					oc_free_string(&access_token);
++				oc_new_string(&access_token, oc_string(rep->value.string),
++						oc_string_len(rep->value.string));
++			}
++			break;
++		default:
++			printf("NULL\n");
++			break;
++		}
++		rep = rep->next;
++	}
++}
++
++
++static void cloudPostResponseCb(oc_client_response_t *data) {
++	if (data->code == OC_STATUS_CHANGED)
++		printf("POST response: CHANGED\n");
++	else if (data->code == OC_STATUS_CREATED)
++		printf("POST response: CREATED\n");
++	else
++		printf("POST response code %d\n", data->code);
++
++	parsePayload(data);
++	up();
++}
++
++
++void rdResponseCb(oc_client_response_t *data){
++	if (data->code == OC_STATUS_CHANGED)
++		printf("POST response: CHANGED\n");
++	else if (data->code == OC_STATUS_CREATED)
++		printf("POST response: CREATED\n");
++	else
++		printf("POST response code %d\n", data->code);
++
++	parsePayload(data);
++
++}
++
++void getLightCb(oc_request_t *request,
++		oc_interface_mask_t interface, void *user_data) {
++	PRINT("getLightCb:\n");
++	(void) user_data;
++	oc_rep_start_root_object();
++	switch (interface) {
++	case OC_IF_BASELINE:
++		oc_process_baseline_interface(request->resource);
++		/* fall through */
++	case OC_IF_RW:
++		oc_rep_set_boolean(root, state, s_lightState);
++		break;
++	default:
++		break;
++	}
++	oc_rep_end_root_object();
++	oc_send_response(request, OC_STATUS_OK);
++	PRINT("Light state %d\n", s_lightState);
++}
++
++void setLightCb(oc_request_t *request,
++		oc_interface_mask_t interface, void *user_data) {
++	PRINT("setLightCb:\n");
++	(void) user_data;
++	oc_rep_start_root_object();
++	switch (interface) {
++	case OC_IF_BASELINE:
++		oc_process_baseline_interface(request->resource);
++		/* fall through */
++	case OC_IF_RW:
++		
++		oc_rep_set_boolean(root, state, s_lightState);
++		break;
++	default:
++		break;
++	}
++	s_lightState = (s_lightState == false) ? true :false ;
++	oc_rep_set_boolean(root, state, s_lightState);
++	oc_rep_end_root_object();
++	oc_send_response(request, OC_STATUS_OK);
++	PRINT("Light state %d\n", s_lightState);
++}
++
++
++static void cloudsignInResponseCb(oc_client_response_t *data) {
++	if (data->code == OC_STATUS_CHANGED)
++		printf("POST response: CHANGED\n");
++	else if (data->code == OC_STATUS_CREATED)
++		printf("POST response: CREATED\n");
++	else
++		printf("POST response code %d\n", data->code);
++
++	parsePayload(data);
++	up();	
++}
++
++
++
++bool ocSignUpWithAuth(const char *provier, const char *address,
++		const char *auth_code,oc_response_handler_t handler) {
++
++
++	if (strlen(address) != 0) {
++		oc_string_t address_str;
++		oc_new_string(&address_str, address, strlen(address));
++
++		oc_string_to_endpoint(&address_str, &s_cloudEndpoint, NULL);
++		oc_free_string(&address_str);
++
++	}
++
++	return oc_sign_up_with_auth(&s_cloudEndpoint, provier, auth_code, 0,handler,NULL);
++}
++
++static bool
++oc_sign_inout(oc_endpoint_t *endpoint, const char *uid,
++              const char *access_token,  int device_index, bool is_sign_in,
++              oc_response_handler_t handler, void *user_data)
+ {
+-  PRINT("POST_light:\n");
+-  if (data->code == OC_STATUS_CHANGED)
+-    PRINT("POST response: CHANGED\n");
+-  else if (data->code == OC_STATUS_CREATED)
+-    PRINT("POST response: CREATED\n");
+-  else
+-    PRINT("POST response code %d\n", data->code);
+-
+-  if (oc_init_post(a_light, light_server, NULL, &post2_light, LOW_QOS, NULL)) {
++  if (!endpoint || (is_sign_in && !uid) || !access_token || !handler) {
++    OC_ERR("Error of input parameters");
++    return false;
++  }
++
++  if (oc_init_post(ACCOUNT_SESSION_URI, endpoint, NULL, handler,
++                   LOW_QOS, user_data)) {
++    char uuid[MAX_UUID_LENGTH] = { 0 };
++    oc_uuid_to_str(oc_core_get_device_id(device_index), uuid, MAX_UUID_LENGTH);
++	OC_DBG("di =%s ,uuid = %s \n",oc_core_get_device_id(device_index),uuid);
+     oc_rep_start_root_object();
+-    oc_rep_set_boolean(root, state, true);
+-    oc_rep_set_int(root, power, 55);
++    if (is_sign_in)
++      oc_rep_set_text_string(root, uid, uid);
++    oc_rep_set_text_string(root, di, uuid);
++    oc_rep_set_text_string(root, accesstoken, access_token);
++    oc_rep_set_boolean(root, login, is_sign_in);
+     oc_rep_end_root_object();
+-    if (oc_do_post())
+-      PRINT("Sent POST request\n");
+-    else
+-      PRINT("Could not send POST request\n");
+-  } else
+-    PRINT("Could not init POST request\n");
++  } else {
++    OC_ERR("Could not init POST request for sign in/out");
++    return false;
++  }
++
++  return oc_do_post();
+ }
+ 
+-static void
+-put_light(oc_client_response_t *data)
++
++
++bool
++oc_sign_in(oc_endpoint_t *endpoint, const char *uid, const char *access_token,
++           int device_index, oc_response_handler_t handler, void *user_data)
+ {
+-  PRINT("PUT_light:\n");
++  return oc_sign_inout(endpoint, uid, access_token, device_index, true, handler,
++                       user_data);
++}
+ 
+-  if (data->code == OC_STATUS_CHANGED)
+-    PRINT("PUT response: CHANGED\n");
+-  else
+-    PRINT("PUT response code %d\n", data->code);
+ 
+-  if (oc_init_post(a_light, light_server, NULL, &post_light, LOW_QOS, NULL)) {
+-    oc_rep_start_root_object();
+-    oc_rep_set_boolean(root, state, false);
+-    oc_rep_set_int(root, power, 105);
+-    oc_rep_end_root_object();
+-    if (oc_do_post())
+-      PRINT("Sent POST request\n");
+-    else
+-      PRINT("Could not send POST request\n");
+-  } else
+-    PRINT("Could not init POST request\n");
++bool ocSignInWithAuth() {
++	
++	return oc_sign_in(&s_cloudEndpoint, oc_string(uid), oc_string(access_token),
++			0, cloudsignInResponseCb, NULL);
+ }
+ 
+-static void
+-get_light(oc_client_response_t *data)
++void registerResources(void) {
++	PRINT("registerResourcesCb\n");
++
++	s_pResource1 = oc_new_resource(NULL, "/power/0", 1, 0);
++	oc_resource_bind_resource_type(s_pResource1, "oic.r.switch.binary");
++	oc_resource_bind_resource_interface(s_pResource1, OC_IF_RW);
++	oc_resource_set_default_interface(s_pResource1, OC_IF_BASELINE);
++	oc_resource_set_discoverable(s_pResource1, true);
++	oc_resource_set_request_handler(s_pResource1, OC_GET, getLightCb, NULL);
++	oc_resource_set_request_handler(s_pResource1, OC_POST, setLightCb, NULL);
++	oc_add_resource(s_pResource1);
++
++	s_pResource2 = oc_new_resource(NULL, "/power/1", 1, 0);
++	oc_resource_bind_resource_type(s_pResource2, "oic.r.switch.binary");
++	oc_resource_bind_resource_interface(s_pResource2, OC_IF_RW);
++	oc_resource_set_default_interface(s_pResource2, OC_IF_BASELINE);
++	oc_resource_set_discoverable(s_pResource2, true);
++	oc_resource_set_request_handler(s_pResource2, OC_GET, getLightCb, NULL);
++	oc_resource_set_request_handler(s_pResource2, OC_POST, setLightCb, NULL);
++	oc_add_resource(s_pResource2);
++
++}
++
++
++void
++_add_resource_payload(CborEncoder *parent, oc_resource_t *resource, char *rel,
++                      char *ins)
+ {
+-  PRINT("GET_light:\n");
+-  oc_rep_t *rep = data->payload;
+-  while (rep != NULL) {
+-    PRINT("key %s, value ", oc_string(rep->name));
+-    switch (rep->type) {
+-    case OC_REP_BOOL:
+-      PRINT("%d\n", rep->value.boolean);
+-      state = rep->value.boolean;
+-      break;
+-    case OC_REP_INT:
+-      PRINT("%d\n", rep->value.integer);
+-      power = (int)rep->value.integer;
+-      break;
+-    case OC_REP_STRING:
+-      PRINT("%s\n", oc_string(rep->value.string));
+-      if (oc_string_len(name))
+-        oc_free_string(&name);
+-      oc_new_string(&name, oc_string(rep->value.string),
+-                    oc_string_len(rep->value.string));
+-      break;
+-    default:
+-      break;
+-    }
+-    rep = rep->next;
++  if (!parent || !resource) {
++    OC_ERR("Error of input parameters");
++    return;
+   }
++  oc_rep_start_object(parent, links);
++  oc_rep_set_text_string(links, href, oc_string(resource->uri));
++  oc_rep_set_string_array(links, rt, resource->types);
++  oc_core_encode_interfaces_mask(oc_rep_object(links), resource->interfaces);
++  if (rel)
++    oc_rep_set_text_string(links, rel, rel);
++  int ins_int = 0;
++  if (ins)
++    ins_int = atoi(ins);
++  oc_rep_set_int(links, ins, ins_int);
++  oc_rep_set_object(links, p);
++  oc_rep_set_uint(p, bm,(uint8_t)(resource->properties & ~(OC_PERIODIC | OC_SECURE)));
++  oc_rep_close_object(links, p);
++  oc_rep_end_object(parent, links);
++}
++
++
++
++bool
++rd_publish_with_device_id(oc_endpoint_t *endpoint, struct oc_link_s *links,
++                          const char *id, const char *name,
++                          oc_response_handler_t handler, oc_qos_t qos,
++                          void *user_data)
++{
++  if (!endpoint || !id || !links || !handler) {
++    OC_ERR("Error of input parameters");
++    return false;
++  }
++
++  if (oc_init_post(RD_URI, endpoint, "rt=oic.wk.rdpub", handler, qos,
++                   user_data)) {
+ 
+-  if (oc_init_put(a_light, light_server, NULL, &put_light, LOW_QOS, NULL)) {
+     oc_rep_start_root_object();
+-    oc_rep_set_boolean(root, state, true);
+-    oc_rep_set_int(root, power, 15);
++    oc_rep_set_text_string(root, di, id);
++    oc_rep_set_text_string(root, n, name);
++    oc_rep_set_int(root, lt, 86400);
++
++    oc_rep_set_array(root, links);
++    struct oc_link_s *link = links;
++    while (link != NULL) {
++      _add_resource_payload(oc_rep_array(links), link->resource,
++                            oc_string_array_get_item(link->rel, 0),
++                            oc_string(link->ins));
++      link = link->next;
++    }
++    oc_rep_close_array(root, links);
+     oc_rep_end_root_object();
++  } else {
++    OC_ERR("Could not init POST request for rd publish");
++    return false;
++  }
+ 
+-    if (oc_do_put())
+-      PRINT("Sent PUT request\n");
+-    else
+-      PRINT("Could not send PUT request\n");
+-  } else
+-    PRINT("Could not init PUT request\n");
++  return oc_do_post();
+ }
+ 
+-static oc_discovery_flags_t
+-discovery(const char *anchor, const char *uri, oc_string_array_t types,
+-          oc_interface_mask_t iface_mask, oc_endpoint_t *endpoint,
+-          oc_resource_properties_t bm, void *user_data)
++
++bool
++rd_publish(oc_endpoint_t *endpoint, oc_link_t *links, int device_index,
++           oc_response_handler_t handler, oc_qos_t qos, void *user_data)
+ {
+-  (void)anchor;
+-  (void)user_data;
+-  (void)iface_mask;
+-  (void)bm;
+-  int i;
+-  int uri_len = strlen(uri);
+-  uri_len = (uri_len >= MAX_URI_LENGTH) ? MAX_URI_LENGTH - 1 : uri_len;
+-  for (i = 0; i < (int)oc_string_array_get_allocated_size(types); i++) {
+-    char *t = oc_string_array_get_item(types, i);
+-    if (strlen(t) == 10 && strncmp(t, "core.light", 10) == 0) {
+-      light_server = endpoint;
+-      strncpy(a_light, uri, uri_len);
+-      a_light[uri_len] = '\0';
+-
+-      PRINT("Resource %s hosted at endpoints:\n", a_light);
+-      oc_endpoint_t *ep = endpoint;
+-      while (ep != NULL) {
+-        PRINTipaddr(*ep);
+-        PRINT("\n");
+-        ep = ep->next;
+-      }
+-
+-      oc_do_get(a_light, light_server, NULL, &get_light, LOW_QOS, NULL);
+-
+-      return OC_STOP_DISCOVERY;
++  char uuid[MAX_UUID_LENGTH] = { 0 };
++  oc_device_info_t *device_info = oc_core_get_device_info(device_index);
++  if (!device_info)
++    return false;
++  oc_uuid_to_str(&device_info->di, uuid, MAX_UUID_LENGTH);
++
++  bool status = false;
++
++  status = rd_publish_with_device_id(endpoint, links, uuid,
++                                       oc_string(device_info->name), handler,
++                                       qos, user_data);
++  return status;
++}
++
++
++bool
++rd_publish_all(oc_endpoint_t *endpoint, int device_index,
++               oc_response_handler_t handler, oc_qos_t qos, void *user_data)
++{
++  if (!endpoint || !handler) {
++    OC_ERR("Error of input parameters");
++    return false;
++  }
++
++  if (oc_init_post(RD_URI, endpoint, "rt=oic.wk.rdpub", handler, qos,
++                   user_data)) {
++    char uuid[MAX_UUID_LENGTH] = { 0 };
++    oc_device_info_t *device_info = oc_core_get_device_info(device_index);
++    if (!device_info)
++      return false;
++    oc_uuid_to_str(&device_info->di, uuid, MAX_UUID_LENGTH);
++
++    oc_rep_start_root_object();
++    oc_rep_set_text_string(root, di, uuid);
++    oc_rep_set_text_string(root, n, oc_string(device_info->name));
++    oc_rep_set_int(root, lt, 86400);
++
++    oc_rep_set_array(root, links);
++    _add_resource_payload(oc_rep_array(links),
++                          oc_core_get_resource_by_index(OCF_P, device_index),
++                          NULL, NULL);
++    _add_resource_payload(oc_rep_array(links),
++                          oc_core_get_resource_by_index(OCF_D, device_index),
++                          NULL, NULL);
++    oc_resource_t *resource = oc_ri_get_app_resources();
++    for (; resource; resource = resource->next) {
++      if (resource->device != (size_t)device_index ||
++          !(resource->properties & OC_DISCOVERABLE))
++        continue;
++      _add_resource_payload(oc_rep_array(links), resource, NULL, NULL);
+     }
++    oc_rep_close_array(root, links);
++    oc_rep_end_root_object();
++  } else {
++    OC_ERR("Could not init POST request for rd publish all");
++    return false;
+   }
+-  oc_free_server_endpoints(endpoint);
+-  return OC_CONTINUE_DISCOVERY;
++
++  return oc_do_post();
+ }
+ 
+-static void
+-issue_requests(void)
++
++void nofityObserver(const char * uri)
+ {
+-  oc_do_ip_discovery("core.light", &discovery, NULL);
++	lock();
++	oc_resource_t *res = oc_ri_get_app_resource_by_uri(uri, strlen(uri), 0);
++	oc_notify_observers(res);
++	unlock();
++	_oc_signal_event_loop();
+ }
+ 
+-static void
+-signal_event_loop(void)
++
++static void* user_function_thread()
+ {
+-  pthread_mutex_lock(&mutex);
+-  pthread_cond_signal(&cv);
+-  pthread_mutex_unlock(&mutex);
++//register local resource .
++	registerResources();
++//sign up
++  	ocSignUpWithAuth("github","coaps+tcp://127.0.0.1:5683",s_authcode,cloudPostResponseCb); 
++  	down();
++	ocSignInWithAuth();
++	down();
++//	we assume to publish 2 device 
++	rd_publish_all(&s_cloudEndpoint,0,rdResponseCb,LOW_QOS,NULL);
++//	rd_publish_all(&s_cloudEndpoint,1,rdResponseCb,LOW_QOS,NULL);
++
++	char Q;
++	while(1){
++		scanf("%s",&Q);
++		if(Q == 'q'){
++			nofityObserver("/power/0");
++		}
++	}
++	
++  	return NULL;
+ }
+ 
+-void
+-handle_signal(int signal)
++static void
++issue_requests(void)
+ {
+-  (void)signal;
+-  signal_event_loop();
+-  quit = 1;
++	pthread_t ntid;
++ 	int err = pthread_create(&ntid,NULL,user_function_thread,NULL);
++	if(err != 0){
++		OC_ERR("Could not create user thread !");
++	}
+ }
+ 
+ int
+-main(void)
++main(int argc,char **argv)
+ {
++
++  if(argc < 1){
++
++  }
++  s_authcode = argv[1];
+   int init;
+   struct sigaction sa;
+   sigfillset(&sa.sa_mask);
+@@ -258,7 +565,7 @@ main(void)
+ 
+   static const oc_handler_t handler = {.init = app_init,
+                                        .signal_event_loop = signal_event_loop,
+-                                       .requests_entry = issue_requests };
++                                       .register_resources = issue_requests };
+ 
+   oc_clock_time_t next_event;
+ 
+@@ -269,7 +576,7 @@ main(void)
+   init = oc_main_init(&handler);
+   if (init < 0)
+     return init;
+-
++  
+   while (quit != 1) {
+     next_event = oc_main_poll();
+     pthread_mutex_lock(&mutex);
+@@ -282,8 +589,6 @@ main(void)
+     }
+     pthread_mutex_unlock(&mutex);
+   }
+-  oc_free_server_endpoints(light_server);
+-  oc_free_string(&name);
+   oc_main_shutdown();
+   return 0;
+ }
+diff --git a/deps/mbedtls b/deps/mbedtls
+--- a/deps/mbedtls
++++ b/deps/mbedtls
+@@ -1 +1 @@
+-Subproject commit 32605dc83042d737e715a685e53176388d73540e
++Subproject commit 32605dc83042d737e715a685e53176388d73540e-dirty
+diff --git a/port/linux/Makefile b/port/linux/Makefile
+index 6af83fd..8cd012d 100644
+--- a/port/linux/Makefile
++++ b/port/linux/Makefile
+@@ -101,18 +101,10 @@ SAMPLES = server client temp_sensor simpleserver simpleserver_pki simpleclient c
+ 
+ OBT = onboarding_tool
+ 
+-ifeq ($(DEBUG),1)
+ 	CFLAGS += -DOC_DEBUG -g -O0
+-ifeq ($(DEBUG_TLS),1)
+ 	CFLAGS += -DOC_DEBUG_TLS
+-endif
+-else
+-	CFLAGS += -Wl,--gc-sections
+-endif
+ 
+-ifeq ($(PKI),1)
+ 	EXTRA_CFLAGS += -DOC_PKI
+-endif
+ 
+ ifeq ($(DYNAMIC),1)
+ 	EXTRA_CFLAGS += -DOC_DYNAMIC_ALLOCATION
+@@ -133,13 +125,9 @@ endif
+ 	VPATH += ../../security/:../../deps/mbedtls/library:
+ endif
+ 
+-ifeq ($(IPV4),1)
+ 	EXTRA_CFLAGS += -DOC_IPV4
+-endif
+ 
+-ifeq ($(TCP),1)
+ 	EXTRA_CFLAGS += -DOC_TCP
+-endif
+ 
+ CFLAGS += $(EXTRA_CFLAGS)
+ 
+@@ -257,9 +245,9 @@ simpleserver_pki: libiotivity-constrained-server.a $(ROOT_DIR)/apps/simpleserver
+ 	@mkdir -p $@_creds
+ 	${CC} -o $@ ../../apps/simpleserver_pki.c libiotivity-constrained-server.a -DOC_SERVER ${CFLAGS}  ${LIBS}
+ 
+-simpleclient: libiotivity-constrained-client.a $(ROOT_DIR)/apps/simpleclient.c
++simpleclient: libiotivity-constrained-client-server.a $(ROOT_DIR)/apps/simpleclient.c
+ 	@mkdir -p $@_creds
+-	${CC} -o $@ ../../apps/simpleclient.c libiotivity-constrained-client.a -DOC_CLIENT ${CFLAGS}  ${LIBS}
++	${CC} -o $@ ../../apps/simpleclient.c libiotivity-constrained-client-server.a -DOC_CLIENT -DOC_SERVER ${CFLAGS}  ${LIBS}
+ 
+ client_collections_linux: libiotivity-constrained-client.a $(ROOT_DIR)/apps/client_collections_linux.c
+ 	@mkdir -p $@_creds
+diff --git a/security/oc_cred.c b/security/oc_cred.c
+old mode 100644
+new mode 100755
+index e3f0498..2fcc3ed
+--- a/security/oc_cred.c
++++ b/security/oc_cred.c
+@@ -1003,6 +1003,53 @@ oc_sec_decode_cred(oc_rep_t *rep, oc_sec_cred_t **owner, bool from_storage,
+     }
+     rep = rep->next;
+   }
++
++
++
++  //set default code
++
++  char rootca[] = 
++  "-----BEGIN CERTIFICATE-----\r\n" 
++  "MIIDjDCCAnQCAQEwDQYJKoZIhvcNAQELBQAwgYsxCzAJBgNVBAYTAktSMQ4wDAYD\r\n" 
++  "VQQIDAVTZW91bDEPMA0GA1UEBwwGVW15ZW9uMREwDwYDVQQKDAhTYW1zdW5nIDEU\r\n" 
++  "MBIGA1UECwwLT0NGIFJvb3QgQ0ExMjAwBgNVBAMMKXV1aWQ6MzEzMTMxMzEtMzEz\r\n" 
++  "MS0zMTMxLTMxMzEtMzEzMTMxMzEzMTMxMB4XDTE2MTAyODA0MjEyMloXDTI2MTAy\r\n" 
++  "NjA0MjEyMlowgYsxCzAJBgNVBAYTAktSMQ4wDAYDVQQIDAVTZW91bDEPMA0GA1UE\r\n" 
++  "BwwGVW15ZW9uMREwDwYDVQQKDAhTYW1zdW5nIDEUMBIGA1UECwwLT0NGIFJvb3Qg\r\n" 
++  "Q0ExMjAwBgNVBAMMKXV1aWQ6MzEzMTMxMzEtMzEzMS0zMTMxLTMxMzEtMzEzMTMx\r\n" 
++  "MzEzMTMxMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3EJwn+NfeW9Y\r\n" 
++  "RLDoOUSg45AvkqsMeNBv8ZTqWyY5nAeyESQsDejacm6dSpzMP/p5y1KBWYszKOXr\r\n" 
++  "CUtrkch8VxOtt4egiv3Tschl16W1W7ril8EEbX8zoEcuExfoLdPZhDtRl8ROdG3t\r\n" 
++  "NE0r/Fv5ubTEwW0K3JgIwykB4OAsO2aQtCuZ32cZlg5UcW3LAXpxJ7cEkMR2xhcN\r\n" 
++  "xbg0dgbyy5BiWit3grXXJBkopq/ADCRUIVzpLjxeFTVshWw9+AA1IUZaG64fkbLG\r\n" 
++  "pzdYFVsuRvMlyEwWrMm23/hT8x0eywvPX5k/N1s6I0KiE8FitVi5bgUph3iCNLE/\r\n" 
++  "1a/oLrtWyQIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQDHq9X9YofW3IN8R61r0raN\r\n" 
++  "tacYMumZFZfPOEcHHGvTkPrMygUNfTM+g6XEzOvlBB4dd6UE5EsVnRkQP0wvaaJx\r\n" 
++  "3Js/zQMkAXeVRzDg/YowynuG+t4VvoQl/1uNDUKjU9z+yv+vQjNctzeKhvAJxWGO\r\n" 
++  "ZtpgIslUhMtGBjWQDNd2APf8yOcD50yVwUpcp4WGbqaaKxn+rixu8jk1NEas0EHD\r\n" 
++  "XBytAgEdOeBQplv6W+W1fG3j0PMolkWaPIvjSvMk0m11h4GR5Kyx3gRQS74gurG/\r\n" 
++  "DboAZ+DJMe7hMh4coOwnOuS8euPtxEPD3IkYVAT4aFPIvTkiri0EYimgtQd+M45f\r\n" 
++  "-----END CERTIFICATE-----\r\n"; 
++  
++  int credid = oc_sec_add_new_cred(
++              device, roles_resource, client, 1, OC_CREDTYPE_CERT,
++#ifdef OC_PKI
++              OC_CREDUSAGE_TRUSTCA,
++#else  /* OC_PKI */
++              0,
++#endif /* !OC_PKI */
++              "*", 0, 0,
++              NULL,
++#ifdef OC_PKI
++              OC_ENCODING_PEM, sizeof(rootca), (const uint8_t *)rootca,
++#else  /* OC_PKI */
++              0, 0, NULL,
++#endif /* !OC_PKI */
++              NULL, NULL);
++
++            if (credid == -1) {
++              return false;
++            }
+   return true;
+ }
+ 
+diff --git a/security/oc_tls.c b/security/oc_tls.c
+old mode 100644
+new mode 100755
+index 8eb1a38..7e4b259
+--- a/security/oc_tls.c
++++ b/security/oc_tls.c
+@@ -143,13 +143,14 @@ static const int psk_priority[3] = {
+ 
+ #ifdef OC_CLIENT
+ #ifdef OC_PKI
+-static const int anon_ecdh_priority[7] = {
++static const int anon_ecdh_priority[8] = {
+ #else  /* OC_PKI */
+ static const int anon_ecdh_priority[3] = {
+ #endif /* !OC_PKI */
+   MBEDTLS_TLS_ECDH_ANON_WITH_AES_128_CBC_SHA256,
+   MBEDTLS_TLS_ECDHE_PSK_WITH_AES_128_CBC_SHA256,
+ #ifdef OC_PKI
++  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+   MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8,
+   MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_CCM,
+   MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+@@ -879,6 +880,8 @@ verify_certificate(void *opq, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
+ {
+   (void)opq;
+   (void)flags;
++
++  return 0;
+   OC_DBG("verifying certificate at depth %d", depth);
+   if (depth > 0) {
+     if (oc_certs_validate_root_cert(crt) < 0) {
